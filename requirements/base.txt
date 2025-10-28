@@ -1,0 +1,54 @@
+# Base requirements for Stellar Network Visualization
+
+# Core Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+python-dateutil>=2.8.2
+
+# Database
+sqlalchemy>=2.0.0
+alembic>=1.11.0
+
+# Stellar Blockchain
+stellar-sdk>=9.0.0
+
+# Network Analysis
+networkx>=3.0
+python-louvain>=0.16  # Community detection
+scipy>=1.11.0  # Required for kamada_kawai_layout and spectral_layout
+
+# Visualization
+plotly>=5.14.0
+pyvis>=0.3.2
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Web Framework (choose one)
+streamlit>=1.28.0
+# OR
+# flask>=3.0.0
+# flask-cors>=4.0.0
+
+# API & HTTP
+requests>=2.31.0
+aiohttp>=3.9.0  # For async requests
+requests-cache>=1.1.0
+
+# Data Validation
+pydantic>=2.5.2  # Required by stellar-sdk 9.0.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# Utilities
+click>=8.1.0  # CLI
+rich>=13.5.0  # Pretty printing
+tqdm>=4.66.0  # Progress bars
+
+# Caching
+diskcache>=5.6.0
+
+# Logging
+loguru>=0.7.0
+
+# Data Export
+openpyxl>=3.1.0  # Excel export
