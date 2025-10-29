@@ -165,13 +165,14 @@ class EnhancedNetworkGraphBuilder:
                     )
                 else:
                     n_nodes = len(graph.nodes())
-                    optimal_k = 3.0 / np.sqrt(n_nodes) if n_nodes > 1 else 1.0
+                    # УВЕЛИЧЕННОЕ отталкивание для предотвращения наложения
+                    optimal_k = 5.0 / np.sqrt(n_nodes) if n_nodes > 1 else 2.0
                     
                     pos = nx.spring_layout(
                         graph, 
-                        k=optimal_k,  # БОЛЬШОЕ отталкивание
-                        iterations=200,  # Много итераций
-                        scale=8.0,  # ОЧЕНЬ БОЛЬШОЙ масштаб!
+                        k=optimal_k,  # УВЕЛИЧЕННОЕ отталкивание (было 3.0)
+                        iterations=300,  # Больше итераций для лучшего распределения
+                        scale=10.0,  # УВЕЛИЧЕННЫЙ масштаб (было 8.0)
                         seed=42
                     )
 
@@ -399,14 +400,14 @@ class EnhancedNetworkGraphBuilder:
         center_radius = (node_size * self.START_WALLET_MULTIPLIER) / 50.0
         regular_radius = node_size / 50.0
         
-        # Минимальное расстояние между ЦЕНТРАМИ узлов
-        min_node_separation = 3 * regular_radius  # 3 радиуса между центрами
+        # УВЕЛИЧЕННОЕ минимальное расстояние между ЦЕНТРАМИ узлов
+        min_node_separation = 5 * regular_radius  # 5 радиусов между центрами (было 3)
         
         # Минимальное расстояние от центра
-        min_distance_from_center = 4 * (center_radius * 2)  # 4 диаметра центрального узла
+        min_distance_from_center = 6 * (center_radius * 2)  # 6 диаметров центрального узла (было 4)
         
         # МАКСИМАЛЬНОЕ расстояние = для узлов с 1 транзакцией (КРАЙ ГРАФА)
-        max_distance = 5.5  # Край графа - узлы с 1 транзакцией здесь!
+        max_distance = 8.0  # Увеличен край графа (было 5.5)
         
         # Собираем информацию о транзакциях с центральным узлом
         neighbors = []

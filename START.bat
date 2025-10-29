@@ -1,26 +1,44 @@
 @echo off
 echo ========================================
-echo  Stellar Network Visualization
-echo  Starting application...
+echo  Stellar Network Visualization Launcher
 echo ========================================
 echo.
 
-REM Активация виртуального окружения (если есть)
-if exist venv\Scripts\activate.bat (
-    echo [1/2] Activating virtual environment...
+REM Get current directory (where this script is located)
+set PROJECT_DIR=%~dp0
+cd /d "%PROJECT_DIR%"
+
+echo Current directory: %PROJECT_DIR%
+echo.
+
+REM Check if virtual environment exists
+if exist ".venv\Scripts\activate.bat" (
+    echo Activating virtual environment (.venv)...
+    call .venv\Scripts\activate.bat
+) else if exist "venv\Scripts\activate.bat" (
+    echo Activating virtual environment (venv)...
     call venv\Scripts\activate.bat
 ) else (
-    echo [!] No virtual environment found, using global Python
+    echo WARNING: No virtual environment found!
+    echo Creating new virtual environment...
+    python -m venv venv
+    call venv\Scripts\activate.bat
+    echo Installing requirements...
+    pip install -r requirements.txt
 )
 
-echo [2/2] Starting Streamlit app...
 echo.
-echo ----------------------------------------
-echo  App will open at: http://localhost:8501
-echo  Press Ctrl+C to stop
+echo Starting Stellar Network Visualization...
 echo ----------------------------------------
 echo.
 
+REM Run the Streamlit app
 streamlit run web\app.py
 
-pause
+REM Keep window open if there's an error
+if errorlevel 1 (
+    echo.
+    echo ERROR: Failed to start the application!
+    echo Please check the error message above.
+    pause
+)

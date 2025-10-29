@@ -33,6 +33,8 @@ class StellarClient:
         self.server = Server(horizon_url=self.horizon_url)
         self.session = self._create_session()
         self.rate_limiter = RateLimiter(settings.API_RATE_LIMIT)
+        self.last_fetch_info = {}  # Информация о последней загрузке
+        self.data_completeness_info = {}  # Информация о полноте данных по кошелькам
         
     def _create_session(self) -> requests.Session:
         """Create HTTP session with retry strategy."""
@@ -135,7 +137,7 @@ class StellarClient:
             payments = []
             
             for payment in response["_embedded"]["records"]:
-                if payment["type"] in ["payment", "create_account", "path_payment_strict_send", "path_payment_strict_receive"]:
+                if payment["type"] in ["payment", "create_account", "path_payment_strict_send", "path_payment_strict_receive", "liquidity_pool_deposit", "liquidity_pool_withdraw"]:
                     payments.append(self._process_payment_data(payment))
             
             return payments
@@ -204,12 +206,12 @@ class StellarClient:
                 
                 # Process and filter payments
                 page_payments = []
-                page_stats = {"payment": 0, "create_account": 0, "path_payment_strict_send": 0, "path_payment_strict_receive": 0}
+                page_stats = {"payment": 0, "create_account": 0, "path_payment_strict_send": 0, "path_payment_strict_receive": 0, "liquidity_pool_deposit": 0, "liquidity_pool_withdraw": 0}
                 filtered_out = {"asset": 0, "date": 0}
                 sample_assets = []  # Для примера что приходит
                 
                 for payment in records:
-                    if payment["type"] not in ["payment", "create_account", "path_payment_strict_send", "path_payment_strict_receive"]:
+                    if payment["type"] not in ["payment", "create_account", "path_payment_strict_send", "path_payment_strict_receive", "liquidity_pool_deposit", "liquidity_pool_withdraw"]:
                         continue
                     
                     page_stats[payment["type"]] = page_stats.get(payment["type"], 0) + 1
@@ -268,9 +270,18 @@ class StellarClient:
                     logger.info(f"Progress: {page_count} pages, {len(all_payments)} payments so far...")
             
             # Показываем warning ТОЛЬКО если реально достигнут лимит (не закончились данные)
+            has_more_data = False
             if page_count >= max_pages and len(records) == 200:
+                has_more_data = True
                 logger.warning(f"⚠️ LIMIT REACHED! Got {len(all_payments)} transactions in {max_pages} pages. Wallet may have MORE data!")
                 logger.warning(f"→ Consider increasing 'Max transactions per wallet' in sidebar")
+            
+            # Сохраняем информацию о полноте для последующего использования
+            self.last_fetch_info = {
+                "has_more": has_more_data,
+                "pages_loaded": page_count,
+                "is_complete": not has_more_data
+            }
             
             logger.info(f"Total: {len(all_payments)} filtered payments from {page_count} pages")
             return all_payments
@@ -421,6 +432,17 @@ class StellarClient:
                 "asset_code": asset_code_result,
                 "asset_issuer": raw_data.get("asset_issuer") or raw_data.get("destination_asset_issuer"),
             })
+        elif raw_data["type"] in ["liquidity_pool_deposit", "liquidity_pool_withdraw"]:
+            # Liquidity pool operations
+            # For deposits: source_account adds liquidity
+            # For withdrawals: source_account removes liquidity
+            payment_data.update({
+                "from": raw_data.get("source_account"),
+                "to": raw_data.get("liquidity_pool_id", "POOL"),  # Pool ID as recipient
+                "amount": Decimal(raw_data.get("amount", "0")),
+                "asset_code": "POOL_SHARE",  # Special marker for pool operations
+                "asset_issuer": raw_data.get("liquidity_pool_id"),
+            })
         
         return payment_data
 
@@ -478,7 +500,7 @@ class StellarDataFetcher:
         direction_filter: Optional[List[str]] = None,
         min_amount: Optional[float] = None,
         max_amount: Optional[float] = None,
-        max_pages: int = 25  # НОВЫЙ ПАРАМЕТР
+        max_pages: int = 50  # Увеличено с 25!
     ) -> Dict[str, Any]:
         """
         Fetch network of wallets connected to a starting wallet.
@@ -726,6 +748,38 @@ class StellarDataFetcher:
         
         logger.info(f"✅ Final wallet_details: {len(wallet_details)} wallets (including {len(wallets_not_found)} placeholders)")
         
+        # Проверяем полноту данных
+        data_completeness = {
+            "has_more_data": False,
+            "total_pages_loaded": 0,
+            "truncated_wallets": [],
+            "is_complete": True,
+            "wallets_check": {}
+        }
+        
+        # Собираем информацию о полноте по всем кошелькам
+        if hasattr(self, 'data_completeness_info'):
+            for wallet_id, info_list in self.data_completeness_info.items():
+                wallet_complete = True
+                total_pages = 0
+                for info in info_list:
+                    if info.get("has_more", False):
+                        wallet_complete = False
+                        data_completeness["has_more_data"] = True
+                        data_completeness["truncated_wallets"].append(wallet_id[:8] + "...")
+                    total_pages += info.get("pages_loaded", 0)
+                
+                data_completeness["wallets_check"][wallet_id[:8] + "..."] = {
+                    "complete": wallet_complete,
+                    "pages": total_pages
+                }
+                data_completeness["total_pages_loaded"] += total_pages
+        
+        data_completeness["is_complete"] = not data_completeness["has_more_data"]
+        
+        # Очищаем информацию для следующего запроса
+        self.data_completeness_info = {}
+        
         return {
             "wallets": wallet_details,
             "transactions": filtered_transactions,
@@ -736,6 +790,7 @@ class StellarDataFetcher:
                 "wallets_discovered": len(wallet_activity),
                 "strategy": strategy,
                 "filtering_stats": filtering_stats,  # ← NEW: Добавили статистику фильтрации
+                "data_completeness": data_completeness  # ← NEW: Информация о полноте данных
             }
         }
     
@@ -751,7 +806,7 @@ class StellarDataFetcher:
         asset_filter: Optional[List[str]] = None,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
-        max_pages: int = 25  # НОВЫЙ ПАРАМЕТР
+        max_pages: int = 50  # Увеличено с 25!
     ):
         """
         Collect wallet activity data recursively WITH FILTERS and PAGINATION.
@@ -800,6 +855,17 @@ class StellarDataFetcher:
                 
                 logger.info(f"Got {len(payments)} payments for asset {asset_code or 'ALL'}")
                 all_payments.extend(payments)
+                
+                # Сохраняем информацию о полноте для этого кошелька
+                if hasattr(self.client, 'last_fetch_info') and self.client.last_fetch_info:
+                    if wallet_id not in self.client.data_completeness_info:
+                        self.client.data_completeness_info[wallet_id] = []
+                    self.client.data_completeness_info[wallet_id].append({
+                        "asset": asset_code or "ALL",
+                        "has_more": self.client.last_fetch_info.get("has_more", False),
+                        "pages_loaded": self.client.last_fetch_info.get("pages_loaded", 0),
+                        "is_complete": self.client.last_fetch_info.get("is_complete", True)
+                    })
             
             logger.info(f"Total collected {len(all_payments)} payments for {wallet_id[:8]}")
             

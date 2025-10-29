@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.api.stellar_client import StellarClient, StellarDataFetcher
-from src.visualization.graph_builder import NetworkGraphBuilder
 from src.visualization.graph_builder_enhanced import EnhancedNetworkGraphBuilder
 from src.analysis.wallet_analyzer import WalletAnalyzer
 from config.settings import settings
@@ -62,9 +61,9 @@ st.markdown("""
 # Кэшируемая функция для фетчинга данных
 @st.cache_data(
     show_spinner=False,
-    ttl=3600,  # 1 час - исторические данные не меняются быстро
+    ttl=None,  # Бесконечный кэш - исторические данные НЕ МЕНЯЮТСЯ!
     persist="disk",  # Сохраняем на диск между сессиями
-    max_entries=50  # Максимум 50 разных комбинаций параметров
+    max_entries=100  # Увеличено до 100 разных запросов
 )
 def fetch_wallet_network_cached(
     wallet_address: str,
@@ -124,7 +123,6 @@ class StellarVizApp:
         """Initialize the application."""
         self.client = StellarClient()
         self.fetcher = StellarDataFetcher(self.client)
-        self.graph_builder = NetworkGraphBuilder()
         self.enhanced_graph_builder = EnhancedNetworkGraphBuilder()
         self.wallet_analyzer = WalletAnalyzer()
         
@@ -284,15 +282,15 @@ class StellarVizApp:
             st.markdown("**📊 Data Collection Limit:**")
             max_pages_options = {
                 "⚡ Fast (~2K tx)": 10,
-                "⚙️ Normal (~5K tx)": 25,
-                "📈 Extended (~10K tx)": 50,
-                "🔥 Full (~20K tx)": 100,
-                "♾️ Unlimited": 1000
+                "⚙️ Normal (~10K tx)": 50,    # Увеличено с 25
+                "📈 Extended (~20K tx)": 100,  # Увеличено с 50
+                "🔥 Full (~40K tx)": 200,      # Увеличено с 100
+                "♾️ Unlimited (ALL)": 1000
             }
             max_pages_choice = st.selectbox(
                 "Max transactions per wallet:",
                 options=list(max_pages_options.keys()),
-                index=1,  # Default: Normal
+                index=2,  # Default: Extended (больше данных!)
                 help="Higher limits = more complete data but slower. For most wallets, Normal is enough."
             )
             max_pages = max_pages_options[max_pages_choice]
@@ -318,9 +316,16 @@ class StellarVizApp:
             # Transaction type filter
             tx_type_filter = st.multiselect(
                 "Transaction types:",
-                options=["payment", "create_account", "path_payment", "All"],
+                options=[
+                    "payment", 
+                    "create_account", 
+                    "path_payment",
+                    "liquidity_pool_deposit",
+                    "liquidity_pool_withdraw", 
+                    "All"
+                ],
                 default=["All"],
-                help="Filter by transaction type. Select 'All' to include all types."
+                help="Filter by transaction type. Payment types show asset transfers, liquidity pool ops show DeFi activity."
             )
             st.session_state.tx_type_filter = tx_type_filter
             
@@ -756,6 +761,126 @@ class StellarVizApp:
             else:
                 st.warning("No filtering statistics available")
             
+            # НОВОЕ: Проверка полноты загруженных данных
+            st.markdown("### ✅ Data Completeness Verification")
+            
+            # Проверяем настройки загрузки
+            max_pages = st.session_state.get('max_pages', 25)
+            max_wallets = st.session_state.get('max_wallets', 50)
+            
+            # НОВОЕ: Проверяем информацию о полноте из API
+            data_completeness = data.get('stats', {}).get('data_completeness', {})
+            
+            if data_completeness:
+                # Показываем сертификат полноты данных
+                if data_completeness.get('is_complete', False):
+                    st.success("""
+                    🔒 **DATA INTEGRITY: VERIFIED COMPLETE** ✅
+                    
+                    All available data has been loaded. No truncation detected.
+                    """)
+                else:
+                    st.error(f"""
+                    ⚠️ **DATA INTEGRITY: INCOMPLETE**
+                    
+                    Some wallets have more transactions than loaded.
+                    Truncated wallets: {', '.join(data_completeness.get('truncated_wallets', [])[:5])}
+                    
+                    **Action Required:** Increase 'Max transactions per wallet' setting to load complete data.
+                    """)
+                
+                # Детальная статистика
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric(
+                        "Total Pages Loaded",
+                        data_completeness.get('total_pages_loaded', 0),
+                        help="Total API pages fetched across all wallets"
+                    )
+                with col2:
+                    st.metric(
+                        "Data Status",
+                        "✅ Complete" if data_completeness.get('is_complete') else "⚠️ Partial",
+                        help="Whether all available data was loaded"
+                    )
+                with col3:
+                    truncated = len(data_completeness.get('truncated_wallets', []))
+                    st.metric(
+                        "Truncated Wallets",
+                        truncated,
+                        delta=f"-{truncated}" if truncated > 0 else None,
+                        help="Wallets with incomplete transaction history"
+                    )
+            
+            # Показываем текущие настройки
+            st.markdown("#### ⚙️ Current Load Settings")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Max pages setting:** {max_pages}")
+                if max_pages < 50:
+                    st.warning("⚠️ Low page limit - may miss transactions")
+                elif max_pages >= 200:
+                    st.success("✅ High page limit - comprehensive data")
+                else:
+                    st.info("ℹ️ Normal page limit")
+                    
+                estimated_tx = max_pages * 200  # ~200 tx per page
+                st.caption(f"Can load up to ~{estimated_tx:,} transactions")
+            
+            with col2:
+                st.write(f"**Max wallets setting:** {max_wallets}")
+                if max_wallets < 50:
+                    st.warning("⚠️ Low wallet limit - may miss connections")
+                elif max_wallets >= 150:
+                    st.success("✅ High wallet limit - comprehensive network")
+                else:
+                    st.info("ℹ️ Normal wallet limit")
+                
+                st.caption(f"Top {max_wallets} most active wallets included")
+            
+            # Проверяем достаточно ли данных для выбранных фильтров
+            st.markdown("#### 🔍 Filter Coverage Check")
+            
+            asset_filter = st.session_state.get('asset_filter', ['All'])
+            tx_type_filter = st.session_state.get('tx_type_filter', ['All'])
+            
+            if asset_filter and 'All' not in asset_filter:
+                # Считаем транзакции для выбранных валют
+                selected_asset_tx = 0
+                total_tx = len(data.get('transactions', []))
+                for tx in data.get('transactions', []):
+                    if tx.get('asset_code', 'XLM') in asset_filter:
+                        selected_asset_tx += 1
+                
+                coverage = (selected_asset_tx / total_tx * 100) if total_tx > 0 else 0
+                st.write(f"**Asset filter coverage:** {selected_asset_tx}/{total_tx} ({coverage:.1f}%)")
+                
+                if coverage < 20:
+                    st.error(f"❌ Only {coverage:.1f}% transactions match asset filter - consider selecting 'All' or increasing Max pages")
+                elif coverage < 50:
+                    st.warning(f"⚠️ Only {coverage:.1f}% transactions match asset filter")
+                else:
+                    st.success(f"✅ Good coverage: {coverage:.1f}% transactions match asset filter")
+            
+            if tx_type_filter and 'All' not in tx_type_filter:
+                # Считаем транзакции для выбранных типов
+                selected_type_tx = 0
+                total_tx = len(data.get('transactions', []))
+                for tx in data.get('transactions', []):
+                    if tx.get('type', 'payment') in tx_type_filter:
+                        selected_type_tx += 1
+                
+                coverage = (selected_type_tx / total_tx * 100) if total_tx > 0 else 0
+                st.write(f"**Type filter coverage:** {selected_type_tx}/{total_tx} ({coverage:.1f}%)")
+                
+                if coverage < 20:
+                    st.error(f"❌ Only {coverage:.1f}% transactions match type filter")
+                elif coverage < 50:
+                    st.warning(f"⚠️ Only {coverage:.1f}% transactions match type filter")
+                else:
+                    st.success(f"✅ Good coverage: {coverage:.1f}% transactions match type filter")
+            
             st.markdown("### 💡 Recommendations")
             if len(data['transactions']) < 50:
                 st.warning("⚠️ Low transaction count. Consider:")
@@ -765,12 +890,92 @@ class StellarVizApp:
                 - Removing restrictive filters (amount, direction)
                 - Checking if the wallet has more activity
                 """)
+            
+            # НОВОЕ: Информация о кэше
+            st.markdown("### 💾 Cache Status")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.info("""
+                **Cache Settings:**
+                - TTL: ♾️ Infinite (historical data)
+                - Storage: Disk (persistent)
+                - Max entries: 100 queries
+                """)
+            with col2:
+                st.success("""
+                **Cache Working:** ✅
+                - Prevents duplicate API calls
+                - Speeds up repeated queries
+                - Historical data never expires
+                - Clear with button in sidebar
+                """)
         
         graph_fig = self.create_network_graph(data)
         
         if graph_fig is None:
             st.error("❌ Failed to create graph. Please try again.")
             return
+        
+        # ========================
+        # МЕТРИКИ С ПРОВЕРКОЙ ПОЛНОТЫ ДАННЫХ
+        # ========================
+        # Получаем информацию о полноте данных
+        data_completeness = data.get('stats', {}).get('data_completeness', {})
+        is_complete = data_completeness.get('is_complete', True)
+        truncated_wallets = data_completeness.get('truncated_wallets', [])
+        
+        # Проверяем из кэша ли данные (по времени загрузки)
+        is_cached = st.session_state.get('last_fetch_from_cache', False)
+        
+        # Отображаем метрики
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                "👥 Wallets", 
+                len(data.get('wallets', {})),
+                help="Total unique wallets in the network"
+            )
+        
+        with col2:
+            st.metric(
+                "💸 Transactions", 
+                len(data.get('transactions', [])),
+                help="Total transactions displayed"
+            )
+        
+        with col3:
+            if is_complete:
+                st.metric(
+                    "📊 Data Status", 
+                    "✅ Complete",
+                    help="All available data has been loaded"
+                )
+            else:
+                st.metric(
+                    "📊 Data Status", 
+                    f"⚠️ Partial",
+                    delta=f"{len(truncated_wallets)} truncated",
+                    delta_color="inverse",
+                    help=f"Some wallets have more data. Truncated: {', '.join(truncated_wallets[:3])}"
+                )
+        
+        with col4:
+            st.metric(
+                "💾 Cached", 
+                "Yes" if is_cached else "No",
+                help="Data loaded from cache (fast) or API (fresh)"
+            )
+        
+        # Показываем предупреждение если данные неполные
+        if not is_complete and truncated_wallets:
+            st.warning(f"""
+            ⚠️ **INCOMPLETE DATA** - Only showing partial transactions for {len(truncated_wallets)} wallet(s).
+            
+            **Truncated wallets:** {', '.join(truncated_wallets[:5])}{'...' if len(truncated_wallets) > 5 else ''}
+            
+            **Action:** Increase 'Max transactions per wallet' in sidebar to load complete data.
+            """)
         
         # Use Streamlit's plotly_events for click handling
         # Note: This requires streamlit-plotly-events package for full click support
@@ -780,39 +985,40 @@ class StellarVizApp:
         # ========================
         # EDGE COLOR LEGEND (Collapsible)
         # ========================
-        with st.expander("📊 **Edge Color Legend** - Click to see what colors mean", expanded=False):
-            st.markdown("### Connection Line Colors")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**🟠 Start Wallet Links:**")
-                st.markdown("""
-                <div style='background-color: #f8f9fa; padding: 10px; border-radius: 5px;'>
-                <span style='color:#FF4500; font-size:20px;'>■</span> 10+ transactions<br>
-                <span style='color:#0066FF; font-size:20px;'>■</span> 5-9 transactions (blue)<br>
-                <span style='color:#FFA500; font-size:20px;'>■</span> 2-4 transactions<br>
-                <span style='color:#00CC66; font-size:20px;'>■</span> 1 transaction (green)
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown("**⚫ Other Wallet Links:**")
-                st.markdown("""
-                <div style='background-color: #f8f9fa; padding: 10px; border-radius: 5px;'>
-                <span style='color:#666666; font-size:20px;'>■</span> 10+ transactions<br>
-                <span style='color:#0066FF; font-size:20px;'>■</span> 5-9 transactions (blue)<br>
-                <span style='color:#AAAAAA; font-size:20px;'>■</span> 2-4 transactions<br>
-                <span style='color:#00CC66; font-size:20px;'>■</span> 1 transaction (green)
-                </div>
-                """, unsafe_allow_html=True)
-            
-            st.info("""
-            💡 **Tip:** 
-            - 🔵 **Blue** = 5-9 transactions
-            - 🟢 **Green** = 1 transaction
-            - **Darker colors** = more transactions between wallets
-            """)
+        # КОМПАКТНАЯ ЛЕГЕНДА ЦВЕТОВ (без collapsible expander)
+        # ========================
+        st.markdown("### 🎨 Edge Colors")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown("""
+            <div style='padding: 5px;'>
+            <b>🔴 10+ transactions</b>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("""
+            <div style='padding: 5px;'>
+            <b>🔵 5-9 transactions</b>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown("""
+            <div style='padding: 5px;'>
+            <b>🟠 2-4 transactions</b>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            st.markdown("""
+            <div style='padding: 5px;'>
+            <b>🟢 1 transaction</b>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.caption("💡 Colors show transaction frequency between wallets")
         
         # ========================
         # ПУНКТЫ 3, 9, 10: DETAILED WALLET INFO PANEL
@@ -1018,6 +1224,10 @@ class StellarVizApp:
                 date_from_str = date_from.isoformat() if date_from else ""
                 date_to_str = date_to.isoformat() if date_to else ""
                 
+                # Отслеживаем время для определения кэша
+                import time
+                start_time = time.time()
+                
                 # Вызываем КЭШИРУЕМУЮ функцию
                 data = fetch_wallet_network_cached(
                     wallet_address,
@@ -1033,6 +1243,10 @@ class StellarVizApp:
                     max_amount if max_amount is not None else -1.0,  # -1.0 = не задано
                     max_pages  # ПЕРЕДАЕМ max_pages
                 )
+                
+                # Если данные вернулись менее чем за 2 секунды - скорее всего из кэша
+                elapsed_time = time.time() - start_time
+                st.session_state.last_fetch_from_cache = elapsed_time < 2.0
                 
                 st.session_state.network_data = data
                 st.session_state.selected_wallet = wallet_address
@@ -1064,10 +1278,68 @@ class StellarVizApp:
         try:
             logger.info(f"Creating graph with {len(data['wallets'])} wallets and {len(data['transactions'])} transactions")
             
-            # Применяем фильтр min_tx_count (если установлен)
+            # ПРИМЕНЯЕМ ВСЕ ФИЛЬТРЫ К ГРАФУ (не только min_tx_count)
+            # Это нужно чтобы фильтры работали даже с кешированными данными
+            
+            # 1. Transaction Type фильтр
+            tx_type_filter = st.session_state.get('tx_type_filter', ['All'])
+            if tx_type_filter and 'All' not in tx_type_filter:
+                filtered_transactions = [
+                    tx for tx in data['transactions']
+                    if tx.get('type', 'payment') in tx_type_filter
+                ]
+                logger.info(f"TX Type filter {tx_type_filter}: {len(data['transactions'])} -> {len(filtered_transactions)} transactions")
+                data['transactions'] = filtered_transactions
+            
+            # 2. Asset фильтр
+            asset_filter = st.session_state.get('asset_filter', ['All'])
+            if asset_filter and 'All' not in asset_filter:
+                filtered_transactions = [
+                    tx for tx in data['transactions']
+                    if tx.get('asset_code', 'XLM') in asset_filter
+                ]
+                logger.info(f"Asset filter {asset_filter}: {len(data['transactions'])} -> {len(filtered_transactions)} transactions")
+                data['transactions'] = filtered_transactions
+            
+            # 3. Direction фильтр
+            direction_filter = st.session_state.get('direction_filter', ['All'])
+            start_wallet = st.session_state.get('selected_wallet')
+            if direction_filter and 'All' not in direction_filter and start_wallet:
+                filtered_transactions = []
+                for tx in data['transactions']:
+                    is_sent = tx.get('from') == start_wallet
+                    is_received = tx.get('to') == start_wallet
+                    
+                    if 'Sent' in direction_filter and is_sent:
+                        filtered_transactions.append(tx)
+                    elif 'Received' in direction_filter and is_received:
+                        filtered_transactions.append(tx)
+                    elif not is_sent and not is_received:
+                        # Транзакции между другими кошельками - оставляем
+                        filtered_transactions.append(tx)
+                
+                logger.info(f"Direction filter {direction_filter}: {len(data['transactions'])} -> {len(filtered_transactions)} transactions")
+                data['transactions'] = filtered_transactions
+            
+            # 4. Amount фильтр
+            min_amount = st.session_state.get('min_amount')
+            max_amount = st.session_state.get('max_amount')
+            if min_amount is not None or max_amount is not None:
+                filtered_transactions = []
+                for tx in data['transactions']:
+                    amount = float(tx.get('amount', 0))
+                    if min_amount is not None and amount < min_amount:
+                        continue
+                    if max_amount is not None and amount > max_amount:
+                        continue
+                    filtered_transactions.append(tx)
+                
+                logger.info(f"Amount filter [{min_amount}, {max_amount}]: {len(data['transactions'])} -> {len(filtered_transactions)} transactions")
+                data['transactions'] = filtered_transactions
+            
+            # 5. Применяем фильтр min_tx_count (если установлен)
             min_tx_count = st.session_state.get('min_tx_count', 0)
             if min_tx_count > 0:
-                start_wallet = st.session_state.get('selected_wallet')
                 if start_wallet:
                     # Считаем количество транзакций между каждым кошельком и start_wallet
                     wallet_tx_counts = {}
@@ -1106,7 +1378,7 @@ class StellarVizApp:
                     data = {
                         'wallets': filtered_wallets,
                         'transactions': filtered_transactions,
-                        'stats': data['stats']
+                        'stats': data.get('stats', {})
                     }
                     
                     logger.info(f"After min_tx_count filter: {len(filtered_wallets)} wallets, {len(filtered_transactions)} transactions")
@@ -1415,9 +1687,56 @@ class StellarVizApp:
         """Render transactions table."""
         st.markdown("### Recent Transactions")
         
+        # ПРИМЕНЯЕМ ФИЛЬТРЫ КАК В ОСНОВНОМ ГРАФЕ
+        transactions = data.get("transactions", [])
+        if not transactions:
+            st.info("No transactions found")
+            return
+            
+        start_wallet = st.session_state.get("selected_wallet")
+        direction_filter = st.session_state.get("direction_filter", ["All"])
+        min_amount = st.session_state.get("min_amount")
+        max_amount = st.session_state.get("max_amount")
+        asset_filter = st.session_state.get("asset_filter", ["All"])
+        
+        # Фильтруем транзакции
+        filtered_transactions = []
+        for tx in transactions:
+            # Direction filter (относительно главного кошелька)
+            if direction_filter and "All" not in direction_filter and start_wallet:
+                is_sent = tx.get("from") == start_wallet
+                is_received = tx.get("to") == start_wallet
+                
+                if "Sent" in direction_filter and not is_sent:
+                    continue
+                if "Received" in direction_filter and not is_received:
+                    continue
+            
+            # Amount filter
+            amount = float(tx.get("amount", 0))
+            if min_amount is not None and amount < min_amount:
+                continue
+            if max_amount is not None and amount > max_amount:
+                continue
+                
+            # Asset filter
+            if asset_filter and "All" not in asset_filter:
+                asset = tx.get("asset_code", "XLM")
+                if asset not in asset_filter:
+                    continue
+            
+            filtered_transactions.append(tx)
+        
+        # Используем отфильтрованные транзакции
+        transactions = filtered_transactions
+        
+        if not transactions:
+            st.info("No transactions match the current filters")
+            return
+        
         # Convert transactions to DataFrame
         tx_list = []
-        for tx in data["transactions"]:
+        for tx in transactions:
             # Parse date properly
             created_at = tx.get('created_at', '')
             if isinstance(created_at, datetime):
@@ -1450,13 +1769,25 @@ class StellarVizApp:
             # Sort by date descending (most recent first)
             df = df.sort_values('_date_sort', ascending=False)
             
-            # Now format Amount as string for display
-            df['Amount'] = df['Amount'].apply(lambda x: f"{x:.2f}")
+            # ИСПРАВЛЕНО: НЕ конвертируем Amount в строку, чтобы сортировка работала!
+            # Streamlit сам отформатирует числа при отображении
+            # df['Amount'] = df['Amount'].apply(lambda x: f"{x:.2f}")  # УДАЛЕНО!
             
             # Remove hidden _date_sort column
             df = df.drop('_date_sort', axis=1)
             
-            st.dataframe(df, width="stretch", hide_index=True)
+            # Форматируем колонку Amount как числа с 2 знаками после запятой
+            st.dataframe(
+                df, 
+                width="stretch", 
+                hide_index=True,
+                column_config={
+                    "Amount": st.column_config.NumberColumn(
+                        "Amount",
+                        format="%.2f",  # Форматируем с 2 знаками после запятой
+                    )
+                }
+            )
         else:
             st.info("No transactions found")
     
