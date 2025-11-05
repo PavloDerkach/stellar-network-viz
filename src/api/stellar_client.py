@@ -1,144 +1,130 @@
 """
-Stellar Horizon API client for fetching blockchain data.
+Stellar Network API Client
+Fixed version with correct depth logic for recursive partner loading
 """
+
 import asyncio
-from datetime import datetime, timedelta, date, time
-from typing import Dict, List, Optional, Any, AsyncGenerator, Union
 import logging
-from decimal import Decimal
-
+from typing import Dict, List, Optional, Any, Set, Tuple
+from datetime import datetime, timedelta
 import aiohttp
-from stellar_sdk import Server, Asset as StellarAsset
+from stellar_sdk import AiohttpClient
+from stellar_sdk.server_async import ServerAsync
 from stellar_sdk.exceptions import NotFoundError, BadRequestError
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import time
 
-from config.settings import settings
-
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-
 class StellarClient:
-    """Client for interacting with Stellar Horizon API."""
+    """Enhanced Stellar API client with recursive network fetching."""
     
-    def __init__(self, horizon_url: Optional[str] = None):
-        """
-        Initialize Stellar client.
-        
-        Args:
-            horizon_url: Custom Horizon server URL (uses settings default if None)
-        """
-        self.horizon_url = horizon_url or settings.horizon_url
-        self.server = Server(horizon_url=self.horizon_url)
-        self.session = self._create_session()
-        self.rate_limiter = RateLimiter(settings.API_RATE_LIMIT)
-        self.last_fetch_info = {}  # Информация о последней загрузке
-        self.data_completeness_info = {}  # Информация о полноте данных по кошелькам
-        
-    def _create_session(self) -> requests.Session:
-        """Create HTTP session with retry strategy."""
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=settings.API_MAX_RETRIES,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        return session
+    def __init__(self, horizon_url: str = "https://horizon.stellar.org"):
+        """Initialize the Stellar client."""
+        self.horizon_url = horizon_url
+        self.client = None
+        self.server = None
+        self._session = None
+        self.rate_limit_remaining = 3600
+        self.rate_limit_reset = None
+        self._request_times = []
+        self._max_requests_per_second = 10
+        self.data_completeness_info = {}
     
-    async def get_account(self, account_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Fetch account details from Stellar network.
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self.connect()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.close()
+    
+    async def connect(self):
+        """Establish connection to Stellar network."""
+        self.client = AiohttpClient()
+        self.server = ServerAsync(horizon_url=self.horizon_url, client=self.client)
+    
+    async def close(self):
+        """Close the connection."""
+        if self.client:
+            await self.client.close()
+    
+    async def _rate_limit(self):
+        """Simple rate limiting."""
+        now = time.time()
+        self._request_times = [t for t in self._request_times if now - t < 1]
         
-        Args:
-            account_id: Stellar account ID
-            
-        Returns:
-            Account data or None if not found
-        """
+        if len(self._request_times) >= self._max_requests_per_second:
+            sleep_time = 1 - (now - self._request_times[0])
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+        
+        self._request_times.append(now)
+    
+    async def get_account_info(self, account_id: str) -> Dict[str, Any]:
+        """Get account information."""
         try:
-            await self.rate_limiter.acquire()
-            account = self.server.accounts().account_id(account_id).call()
-            return self._process_account_data(account)
+            await self._rate_limit()
+            account = await self.server.accounts().account_id(account_id).call()
+            return {
+                "id": account["id"],
+                "sequence": account["sequence"],
+                "balances": account["balances"],
+                "thresholds": account["thresholds"],
+                "flags": account["flags"],
+                "created_at": account.get("created_at"),
+            }
         except NotFoundError:
-            # Старые удалённые кошельки - это нормально, не ошибка
-            logger.debug(f"Account not found (may be deleted/merged): {account_id}")
+            logger.warning(f"Account {account_id} not found")
             return None
         except Exception as e:
             logger.error(f"Error fetching account {account_id}: {e}")
             return None
     
-    async def get_transactions(
+    async def get_account_payments_enhanced(
         self,
         account_id: str,
         limit: int = 200,
         order: str = "desc",
-        cursor: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch transactions for an account.
-        
-        Args:
-            account_id: Stellar account ID
-            limit: Maximum number of transactions to fetch
-            order: Order of results ('asc' or 'desc')
-            cursor: Pagination cursor
-            
-        Returns:
-            List of transaction data
-        """
-        try:
-            await self.rate_limiter.acquire()
-            
-            builder = self.server.transactions().for_account(account_id)
-            builder.limit(min(limit, 200))  # API max is 200
-            builder.order(order)
-            
-            if cursor:
-                builder.cursor(cursor)
-            
-            response = builder.call()
-            return [self._process_transaction_data(tx) for tx in response["_embedded"]["records"]]
-            
-        except Exception as e:
-            logger.error(f"Error fetching transactions for {account_id}: {e}")
-            return []
-    
-    async def get_payments(
-        self,
-        account_id: str,
-        limit: int = 200,
+        cursor: Optional[str] = None,
         include_failed: bool = False
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch payment operations for an account.
+        """Get payments with enhanced error handling and pagination support."""
+        payments = []
         
-        Args:
-            account_id: Stellar account ID
-            limit: Maximum number of payments to fetch
-            include_failed: Whether to include failed operations
-            
-        Returns:
-            List of payment data
-        """
         try:
-            await self.rate_limiter.acquire()
+            await self._rate_limit()
             
-            builder = self.server.payments().for_account(account_id)
-            builder.limit(min(limit, 200))
+            builder = self.server.payments().for_account(account_id).limit(limit).order(order)
+            
+            if cursor:
+                builder = builder.cursor(cursor)
             
             if include_failed:
-                builder.include_failed(True)
+                builder = builder.include_failed_transactions()
             
-            response = builder.call()
-            payments = []
+            response = await builder.call()
             
-            for payment in response["_embedded"]["records"]:
-                if payment["type"] in ["payment", "create_account", "path_payment_strict_send", "path_payment_strict_receive", "liquidity_pool_deposit", "liquidity_pool_withdraw"]:
-                    payments.append(self._process_payment_data(payment))
+            for record in response["_embedded"]["records"]:
+                if record["type"] in ["payment", "path_payment_strict_send", "path_payment_strict_receive"]:
+                    payment = {
+                        "id": record["id"],
+                        "type": record["type"],
+                        "created_at": record["created_at"],
+                        "transaction_hash": record["transaction_hash"],
+                        "from": record.get("from", record.get("source_account", "")),
+                        "to": record.get("to", ""),
+                        "amount": float(record.get("amount", 0)),
+                        "asset_type": record.get("asset_type", "native"),
+                        "asset_code": record.get("asset_code", "XLM"),
+                        "asset_issuer": record.get("asset_issuer", ""),
+                    }
+                    payments.append(payment)
             
             return payments
             
@@ -150,342 +136,181 @@ class StellarClient:
         self,
         account_id: str,
         asset_code: Optional[str] = None,
-        asset_issuer: Optional[str] = None,
-        date_from: Union[datetime, date, None] = None,
-        date_to: Union[datetime, date, None] = None,
-        max_pages: int = 1000,  # Защита от бесконечного цикла
-        include_failed: bool = False
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        max_pages: int = 50
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch ALL payment operations for an account with pagination and filters.
-        
-        Args:
-            account_id: Stellar account ID
-            asset_code: Filter by asset code (e.g., "USDC", "XLM")
-            asset_issuer: Filter by asset issuer
-            date_from: Start date for filtering
-            date_to: End date for filtering
-            max_pages: Maximum number of pages to fetch (safety limit)
-            include_failed: Whether to include failed operations
-            
-        Returns:
-            List of ALL filtered payment data
-        """
-        # Convert date objects to datetime if needed
-        if date_from is not None and isinstance(date_from, date) and not isinstance(date_from, datetime):
-            date_from = datetime.combine(date_from, time.min)
-        if date_to is not None and isinstance(date_to, date) and not isinstance(date_to, datetime):
-            date_to = datetime.combine(date_to, time.max)
-        
+        """Get ALL payments for account with filters, handling pagination automatically."""
         all_payments = []
         cursor = None
-        page_count = 0
+        pages_fetched = 0
         
-        logger.info(f"Fetching ALL payments for {account_id[:8]}... (asset: {asset_code or 'ALL'})")
+        # Convert date to datetime if needed for comparison
+        from datetime import date as date_type, timezone
+        if date_from and isinstance(date_from, date_type) and not isinstance(date_from, datetime):
+            date_from = datetime.combine(date_from, datetime.min.time()).replace(tzinfo=timezone.utc)
+        if date_to and isinstance(date_to, date_type) and not isinstance(date_to, datetime):
+            date_to = datetime.combine(date_to, datetime.max.time()).replace(tzinfo=timezone.utc)
         
-        try:
-            while page_count < max_pages:
-                await self.rate_limiter.acquire()
+        logger.info(f"Fetching {asset_code or 'ALL'} payments for {account_id[:8]}...")
+        logger.info(f"🔍 [stellar_client.py] get_all_payments_filtered() вызван с MAX_PAGES={max_pages}")
+        if date_from:
+            logger.info(f"  Date from: {date_from}")
+        if date_to:
+            logger.info(f"  Date to: {date_to}")
+        
+        while pages_fetched < max_pages:
+            try:
+                await self._rate_limit()
                 
-                # Build request
-                builder = self.server.payments().for_account(account_id)
-                builder.limit(200)  # Maximum per request
+                builder = self.server.payments().for_account(account_id).limit(200).order("desc")
                 
                 if cursor:
-                    builder.cursor(cursor)
+                    builder = builder.cursor(cursor)
                 
-                if include_failed:
-                    builder.include_failed(True)
-                
-                # Fetch page
-                response = builder.call()
-                records = response.get("_embedded", {}).get("records", [])
+                response = await builder.call()
+                records = response["_embedded"]["records"]
                 
                 if not records:
                     break
                 
-                # Process and filter payments
-                page_payments = []
-                page_stats = {"payment": 0, "create_account": 0, "path_payment_strict_send": 0, "path_payment_strict_receive": 0, "liquidity_pool_deposit": 0, "liquidity_pool_withdraw": 0}
-                filtered_out = {"asset": 0, "date": 0}
-                sample_assets = []  # Для примера что приходит
-                
-                for payment in records:
-                    if payment["type"] not in ["payment", "create_account", "path_payment_strict_send", "path_payment_strict_receive", "liquidity_pool_deposit", "liquidity_pool_withdraw"]:
+                batch_payments = []
+                for record in records:
+                    if record["type"] not in ["payment", "path_payment_strict_send", "path_payment_strict_receive"]:
                         continue
                     
-                    page_stats[payment["type"]] = page_stats.get(payment["type"], 0) + 1
+                    created_at = datetime.fromisoformat(record["created_at"].replace('Z', '+00:00'))
                     
-                    processed = self._process_payment_data(payment)
+                    if date_to and created_at > date_to:
+                        continue
+                    if date_from and created_at < date_from:
+                        logger.info(f"  Reached date limit at {created_at}, stopping pagination")
+                        pages_fetched = max_pages
+                        break
                     
-                    # Логируем первые 3 примера asset_code
-                    if len(sample_assets) < 3:
-                        sample_assets.append({
-                            "type": payment["type"],
-                            "asset": processed.get("asset_code"),
-                            "raw_asset": payment.get("asset_code"),
-                            "raw_dest_asset": payment.get("destination_asset_code")
-                        })
-                    
-                    # Filter by asset
-                    if asset_code and processed.get("asset_code") != asset_code:
-                        filtered_out["asset"] += 1
+                    payment_asset = record.get("asset_code", "XLM")
+                    if asset_code and payment_asset != asset_code:
                         continue
                     
-                    if asset_issuer and processed.get("asset_issuer") != asset_issuer:
-                        filtered_out["asset"] += 1
-                        continue
-                    
-                    # Filter by date
-                    created_at = processed.get("created_at")
-                    if created_at:
-                        if date_from and created_at < date_from:
-                            filtered_out["date"] += 1
-                            continue
-                        if date_to and created_at > date_to:
-                            filtered_out["date"] += 1
-                            continue
-                    
-                    page_payments.append(processed)
+                    payment = {
+                        "id": record["id"],
+                        "type": record["type"],
+                        "created_at": record["created_at"],
+                        "transaction_hash": record["transaction_hash"],
+                        "from": record.get("from", record.get("source_account", "")),
+                        "to": record.get("to", ""),
+                        "amount": float(record.get("amount", 0)),
+                        "asset_type": record.get("asset_type", "native"),
+                        "asset_code": payment_asset,
+                        "asset_issuer": record.get("asset_issuer", ""),
+                    }
+                    batch_payments.append(payment)
                 
-                if page_count == 0:  # Логируем только для первой страницы
-                    logger.info(f"Page stats: {page_stats} | Matched after filter: {len(page_payments)}")
-                    logger.info(f"Filtered out - by asset: {filtered_out['asset']}, by date: {filtered_out['date']}")
-                    logger.info(f"Looking for asset: {asset_code}")
-                    logger.info(f"Sample assets from API: {sample_assets}")
+                all_payments.extend(batch_payments)
+                pages_fetched += 1
                 
-                all_payments.extend(page_payments)
-                page_count += 1
-                
-                # Check if we got less than 200 records (end of data)
-                if len(records) < 200:
-                    logger.info(f"Fetched {len(all_payments)} payments in {page_count} pages (end reached)")
+                if pages_fetched >= max_pages:
+                    logger.info(f"  Reached max pages limit ({max_pages})")
+                    self.last_fetch_info = {
+                        'hit_max_pages': True,
+                        'pages_fetched': pages_fetched,
+                        'total_payments': len(all_payments)
+                    }
                     break
                 
-                # Get cursor for next page
-                cursor = records[-1].get("paging_token")
+                if "next" in response["_links"]:
+                    next_href = response["_links"]["next"]["href"]
+                    cursor_start = next_href.find("cursor=") + 7
+                    cursor_end = next_href.find("&", cursor_start)
+                    cursor = next_href[cursor_start:] if cursor_end == -1 else next_href[cursor_start:cursor_end]
+                else:
+                    break
                 
-                # Progress logging
-                if page_count % 10 == 0:
-                    logger.info(f"Progress: {page_count} pages, {len(all_payments)} payments so far...")
+                if pages_fetched % 10 == 0:
+                    logger.info(f"  Fetched {pages_fetched} pages, {len(all_payments)} payments so far...")
+                
+            except Exception as e:
+                logger.error(f"Error fetching page {pages_fetched + 1}: {e}")
+                break
+        
+        logger.info(f"  Total: {len(all_payments)} {asset_code or 'ALL'} payments from {pages_fetched} pages")
+        
+        if pages_fetched >= max_pages:
+            logger.warning(f"  ⚠️ Hit page limit! May be missing older transactions")
+        
+        return all_payments
+    
+    async def get_account_transactions(
+        self, 
+        account_id: str,
+        limit: int = 200,
+        include_failed: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Get account transactions."""
+        transactions = []
+        
+        try:
+            await self._rate_limit()
             
-            # Показываем warning ТОЛЬКО если реально достигнут лимит (не закончились данные)
-            has_more_data = False
-            if page_count >= max_pages and len(records) == 200:
-                has_more_data = True
-                logger.warning(f"⚠️ LIMIT REACHED! Got {len(all_payments)} transactions in {max_pages} pages. Wallet may have MORE data!")
-                logger.warning(f"→ Consider increasing 'Max transactions per wallet' in sidebar")
+            builder = self.server.transactions().for_account(account_id).limit(limit)
+            if include_failed:
+                builder = builder.include_failed_transactions()
             
-            # Сохраняем информацию о полноте для последующего использования
-            self.last_fetch_info = {
-                "has_more": has_more_data,
-                "pages_loaded": page_count,
-                "is_complete": not has_more_data
-            }
+            response = await builder.call()
             
-            logger.info(f"Total: {len(all_payments)} filtered payments from {page_count} pages")
-            return all_payments
+            for tx in response["_embedded"]["records"]:
+                transactions.append({
+                    "id": tx["id"],
+                    "hash": tx["hash"],
+                    "ledger": tx["ledger"],
+                    "created_at": tx["created_at"],
+                    "fee_charged": tx.get("fee_charged", 0),
+                    "operation_count": tx["operation_count"],
+                    "memo_type": tx.get("memo_type"),
+                    "memo": tx.get("memo"),
+                    "successful": tx.get("successful", True),
+                })
+            
+            return transactions
             
         except Exception as e:
-            logger.error(f"Error fetching all payments for {account_id}: {e}")
-            return all_payments  # Return what we got so far
+            logger.error(f"Error fetching transactions for {account_id}: {e}")
+            return []
     
-    async def get_network_stats(self) -> Dict[str, Any]:
-        """
-        Fetch current network statistics.
-        
-        Returns:
-            Network statistics data
-        """
+    async def get_transaction_details(self, tx_hash: str) -> Dict[str, Any]:
+        """Get detailed transaction information."""
         try:
-            await self.rate_limiter.acquire()
+            await self._rate_limit()
             
-            # Get latest ledger
-            ledger = self.server.ledgers().order(desc=True).limit(1).call()
-            latest_ledger = ledger["_embedded"]["records"][0]
+            tx = await self.server.transactions().transaction(tx_hash).call()
+            ops = await self.server.operations().for_transaction(tx_hash).call()
             
-            # Get fee stats
-            fee_stats = self.server.fee_stats().call()
+            operations = []
+            for op in ops["_embedded"]["records"]:
+                operations.append({
+                    "id": op["id"],
+                    "type": op["type"],
+                    "created_at": op["created_at"],
+                    "details": {k: v for k, v in op.items() 
+                               if k not in ["_links", "self", "transaction", "effects", "succeeds", "precedes"]}
+                })
             
             return {
-                "latest_ledger": latest_ledger["sequence"],
-                "closed_at": latest_ledger["closed_at"],
-                "total_operations": latest_ledger["operation_count"],
-                "base_fee": fee_stats["last_ledger_base_fee"],
-                "max_fee": fee_stats["max_fee"]["max"],
+                "hash": tx["hash"],
+                "ledger": tx["ledger"],
+                "created_at": tx["created_at"],
+                "source_account": tx["source_account"],
+                "fee_charged": tx.get("fee_charged", 0),
+                "operation_count": tx["operation_count"],
+                "operations": operations,
+                "memo_type": tx.get("memo_type"),
+                "memo": tx.get("memo"),
+                "successful": tx.get("successful", True),
             }
             
         except Exception as e:
-            logger.error(f"Error fetching network stats: {e}")
-            return {}
-    
-    async def stream_transactions(
-        self,
-        account_id: Optional[str] = None,
-        cursor: str = "now"
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """
-        Stream transactions in real-time.
-        
-        Args:
-            account_id: Optional account ID to filter transactions
-            cursor: Starting cursor for streaming
-            
-        Yields:
-            Transaction data as it arrives
-        """
-        async with aiohttp.ClientSession() as session:
-            url = f"{self.horizon_url}/transactions"
-            params = {"cursor": cursor}
-            
-            if account_id:
-                url = f"{self.horizon_url}/accounts/{account_id}/transactions"
-            
-            async with session.get(url, params=params) as response:
-                async for line in response.content:
-                    if line.startswith(b"data: "):
-                        try:
-                            import json
-                            data = json.loads(line[6:])
-                            yield self._process_transaction_data(data)
-                        except json.JSONDecodeError:
-                            continue
-    
-    def _process_account_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Process raw account data from API."""
-        return {
-            "account_id": raw_data["account_id"],
-            "sequence": raw_data["sequence"],
-            "balance_xlm": Decimal(next(
-                (b["balance"] for b in raw_data["balances"] if b["asset_type"] == "native"),
-                "0"
-            )),
-            "num_subentries": raw_data.get("num_subentries", 0),
-            "flags": raw_data.get("flags", {}).get("auth_required", False),
-            "thresholds": raw_data.get("thresholds", {}),
-            "last_modified_ledger": raw_data.get("last_modified_ledger"),
-            "created_at": datetime.utcnow(),
-        }
-    
-    def _process_transaction_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Process raw transaction data from API."""
-        return {
-            "transaction_hash": raw_data["hash"],
-            "ledger_sequence": raw_data["ledger"],
-            "created_at": datetime.fromisoformat(raw_data["created_at"].rstrip("Z")),
-            "source_account": raw_data["source_account"],
-            "fee": int(raw_data["fee_charged"]),
-            "operation_count": raw_data["operation_count"],
-            "successful": raw_data["successful"],
-            "memo_type": raw_data.get("memo_type", "none"),
-            "memo": raw_data.get("memo"),
-            "paging_token": raw_data["paging_token"],
-        }
-    
-    def _process_payment_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Process raw payment operation data from API."""
-        payment_data = {
-            "id": raw_data["id"],
-            "type": raw_data["type"],
-            "created_at": datetime.fromisoformat(raw_data["created_at"].rstrip("Z")),
-            "transaction_hash": raw_data["transaction_hash"],
-            "source_account": raw_data.get("source_account", raw_data.get("from")),
-        }
-        
-        if raw_data["type"] == "payment":
-            payment_data.update({
-                "from": raw_data["from"],
-                "to": raw_data["to"],
-                "amount": Decimal(raw_data["amount"]),
-                "asset_code": raw_data.get("asset_code", "XLM"),
-                "asset_issuer": raw_data.get("asset_issuer"),
-            })
-        elif raw_data["type"] == "create_account":
-            payment_data.update({
-                "from": raw_data["source_account"],
-                "to": raw_data["account"],
-                "amount": Decimal(raw_data["starting_balance"]),
-                "asset_code": "XLM",
-                "asset_issuer": None,
-            })
-        elif raw_data["type"] in ["path_payment_strict_send", "path_payment_strict_receive"]:
-            # Path payments могут иметь разные активы для отправки и получения
-            # Используем актив назначения (destination_asset)
-            
-            # DEBUG: посмотрим что есть в raw_data
-            asset_code_result = raw_data.get("asset_code") or raw_data.get("destination_asset_code", "XLM")
-            
-            if not hasattr(self, '_logged_path_payment'):
-                logger.info(f"DEBUG path_payment structure:")
-                logger.info(f"  type: {raw_data['type']}")
-                logger.info(f"  asset_code: {raw_data.get('asset_code')}")
-                logger.info(f"  destination_asset_code: {raw_data.get('destination_asset_code')}")
-                logger.info(f"  asset_type: {raw_data.get('asset_type')}")
-                logger.info(f"  destination_asset_type: {raw_data.get('destination_asset_type')}")
-                logger.info(f"  RESULT asset_code: {asset_code_result}")
-                self._logged_path_payment = True
-            
-            payment_data.update({
-                "from": raw_data.get("from") or raw_data.get("source_account"),
-                "to": raw_data.get("to"),
-                "amount": Decimal(raw_data.get("amount", raw_data.get("destination_amount", "0"))),
-                "asset_code": asset_code_result,
-                "asset_issuer": raw_data.get("asset_issuer") or raw_data.get("destination_asset_issuer"),
-            })
-        elif raw_data["type"] in ["liquidity_pool_deposit", "liquidity_pool_withdraw"]:
-            # Liquidity pool operations
-            # For deposits: source_account adds liquidity
-            # For withdrawals: source_account removes liquidity
-            payment_data.update({
-                "from": raw_data.get("source_account"),
-                "to": raw_data.get("liquidity_pool_id", "POOL"),  # Pool ID as recipient
-                "amount": Decimal(raw_data.get("amount", "0")),
-                "asset_code": "POOL_SHARE",  # Special marker for pool operations
-                "asset_issuer": raw_data.get("liquidity_pool_id"),
-            })
-        
-        return payment_data
-
-
-class RateLimiter:
-    """Simple rate limiter for API calls."""
-    
-    def __init__(self, calls_per_minute: int):
-        """
-        Initialize rate limiter.
-        
-        Args:
-            calls_per_minute: Maximum API calls per minute
-        """
-        self.calls_per_minute = calls_per_minute
-        self.min_interval = 60.0 / calls_per_minute
-        self.last_call_time = 0
-        self.lock = asyncio.Lock()
-    
-    async def acquire(self):
-        """Wait if necessary to respect rate limit."""
-        async with self.lock:
-            current_time = asyncio.get_event_loop().time()
-            time_since_last_call = current_time - self.last_call_time
-            
-            if time_since_last_call < self.min_interval:
-                sleep_time = self.min_interval - time_since_last_call
-                await asyncio.sleep(sleep_time)
-            
-            self.last_call_time = asyncio.get_event_loop().time()
-
-
-class StellarDataFetcher:
-    """High-level data fetcher using StellarClient."""
-    
-    def __init__(self, client: Optional[StellarClient] = None):
-        """
-        Initialize data fetcher.
-        
-        Args:
-            client: StellarClient instance (creates new if None)
-        """
-        self.client = client or StellarClient()
+            logger.error(f"Error fetching transaction {tx_hash}: {e}")
+            return None
     
     async def fetch_wallet_network(
         self,
@@ -495,12 +320,12 @@ class StellarDataFetcher:
         strategy: str = "most_active",
         asset_filter: Optional[List[str]] = None,
         tx_type_filter: Optional[List[str]] = None,
-        date_from: Union[datetime, date, None] = None,
-        date_to: Union[datetime, date, None] = None,
-        direction_filter: Optional[List[str]] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        direction_filter: Optional[str] = None,
         min_amount: Optional[float] = None,
         max_amount: Optional[float] = None,
-        max_pages: int = 50  # Увеличено с 25!
+        max_pages: int = 50
     ) -> Dict[str, Any]:
         """
         Fetch network of wallets connected to a starting wallet.
@@ -525,259 +350,178 @@ class StellarDataFetcher:
         Returns:
             Network data with wallets and transactions
         """
-        wallet_activity = {}  # Track activity for each wallet
+        wallet_activity = {}
         transactions = []
         visited = set()
         
-        # First pass: collect all connected wallets and their activity WITH FILTERS
         await self._collect_wallet_activity(
             start_wallet, 
             wallet_activity, 
             transactions, 
             visited, 
             depth, 
-            max_wallets * 2,  # Collect more initially to filter
+            max_wallets * 2,
             asset_filter=asset_filter,
             date_from=date_from,
             date_to=date_to,
-            max_pages=max_pages  # ПЕРЕДАЕМ max_pages
+            max_pages=max_pages
         )
         
-        # Select top wallets based on strategy
+        logger.info(f"\n{'='*50}")
+        logger.info(f"TRANSACTION FILTERING")
+        logger.info(f"{'='*50}")
+        logger.info(f"Total collected transactions: {len(transactions)}")
+        logger.info(f"Total collected wallets: {len(wallet_activity)}")
+        
+        # НОВАЯ ЛОГИКА: Приоритет прямым связям стартового кошелька
+        direct_partners = set()
+        start_tx_count = 0
+        
+        # Найдём всех прямых партнёров стартового кошелька
+        for tx in transactions:
+            if tx['from'] == start_wallet:
+                direct_partners.add(tx['to'])
+                start_tx_count += 1
+            elif tx['to'] == start_wallet:
+                direct_partners.add(tx['from'])
+                start_tx_count += 1
+        
+        logger.info(f"Start wallet has {start_tx_count} transactions with {len(direct_partners)} unique partners")
+        logger.info(f"Current wallet_activity before adding partners: {list(wallet_activity.keys())}")
+        
+        # КРИТИЧНО для depth=0: Добавляем партнёров в wallet_activity!
+        partners_added = 0
+        for partner in direct_partners:
+            if partner not in wallet_activity:
+                # Подсчитаем статистику по транзакциям партнёра
+                partner_tx_count = 0
+                partner_volume = 0
+                partner_counterparties = set()
+                
+                for tx in transactions:
+                    if tx['from'] == partner or tx['to'] == partner:
+                        partner_tx_count += 1
+                        partner_volume += tx.get('amount', 0)
+                        if tx['from'] == partner:
+                            partner_counterparties.add(tx['to'])
+                        if tx['to'] == partner:
+                            partner_counterparties.add(tx['from'])
+                
+                wallet_activity[partner] = {
+                    "transaction_count": partner_tx_count,
+                    "total_volume": partner_volume,
+                    "counterparties": partner_counterparties,
+                    "has_direct_tx_with_start": True
+                }
+                partners_added += 1
+                logger.info(f"  Added partner {partner[:8]}... to wallet_activity ({partner_tx_count} txs)")
+        
+        logger.info(f"✅ Added {partners_added} partners. Total wallets now: {len(wallet_activity)}")
+        
+        # Помечаем прямых партнёров
+        for wallet_id in direct_partners:
+            if wallet_id in wallet_activity:
+                wallet_activity[wallet_id]['has_direct_tx_with_start'] = True
+                
+        # Отбираем топ кошельки с ПРИОРИТЕТОМ прямых связей
         if strategy == "most_active":
-            # Sort by activity (number of transactions)
-            sorted_wallets = sorted(
-                wallet_activity.items(), 
-                key=lambda x: x[1]["transaction_count"], 
-                reverse=True
-            )
-            top_wallets = [w[0] for w in sorted_wallets[:max_wallets]]
+            # СНАЧАЛА берём ВСЕ прямые связи
+            top_wallets = list(direct_partners)
+            logger.info(f"Including ALL {len(direct_partners)} direct partners first")
+            
+            # ПОТОМ добавляем самые активные из остальных
+            if len(top_wallets) < max_wallets:
+                other_wallets = [(w, data) for w, data in wallet_activity.items() 
+                                 if w not in direct_partners]
+                other_wallets.sort(key=lambda x: x[1]["transaction_count"], reverse=True)
+                
+                remaining_slots = max_wallets - len(top_wallets)
+                for wallet_id, _ in other_wallets[:remaining_slots]:
+                    top_wallets.append(wallet_id)
+                    
+                logger.info(f"Added {min(remaining_slots, len(other_wallets))} additional active wallets")
         else:
-            # Use first max_wallets found (breadth-first)
-            top_wallets = list(wallet_activity.keys())[:max_wallets]
+            # breadth_first - но всё равно включаем прямые связи первыми
+            top_wallets = list(direct_partners)[:max_wallets]
+            if len(top_wallets) < max_wallets:
+                for wallet_id in wallet_activity.keys():
+                    if wallet_id not in direct_partners:
+                        top_wallets.append(wallet_id)
+                        if len(top_wallets) >= max_wallets:
+                            break
         
-        # Filter transactions to only include those between top wallets
-        # BUT: keep all transactions with start_wallet to preserve direct connections
-        logger.info(f"========== TRANSACTION FILTERING ==========")
-        logger.info(f"Total transactions collected: {len(transactions)}")
         logger.info(f"Top wallets selected: {len(top_wallets)}")
-        logger.info(f"Top wallet IDs: {[w[:8] + '...' for w in list(top_wallets)[:5]]}")
         
-        # ПОКАЗЫВАЕМ ПРИМЕРЫ ТРАНЗАКЦИЙ ДО ФИЛЬТРАЦИИ
-        if transactions:
-            logger.info(f"📋 SAMPLE TRANSACTIONS BEFORE FILTERING (first 5):")
-            for i, tx in enumerate(transactions[:5]):
-                logger.info(f"  TX {i+1}: from={tx.get('from', 'N/A')[:8]}... to={tx.get('to', 'N/A')[:8]}... "
-                          f"asset={tx.get('asset_code', 'XLM')} amount={tx.get('amount')} type={tx.get('type')}")
+        # Проверяем что GDT7...GULJ включён (если есть)
+        gulj_wallet = None
+        for wallet in top_wallets:
+            if wallet.startswith("GDT7") and "GULJ" in wallet:
+                gulj_wallet = wallet
+                logger.info(f"✅ CONFIRMED: {gulj_wallet[:8]}...{gulj_wallet[-4:]} is in top wallets!")
+                break
         
-        # Проверяем сколько from/to есть в top_wallets
-        from_in_top = sum(1 for tx in transactions if tx.get("from") in top_wallets)
-        to_in_top = sum(1 for tx in transactions if tx.get("to") in top_wallets)
-        both_in_top = sum(1 for tx in transactions if tx.get("from") in top_wallets and tx.get("to") in top_wallets)
-        logger.info(f"Transactions with FROM in top_wallets: {from_in_top}")
-        logger.info(f"Transactions with TO in top_wallets: {to_in_top}")
-        logger.info(f"Transactions with BOTH in top_wallets: {both_in_top}")
-        
-        # ИСПРАВЛЕНИЕ: Сохраняем ЛЮБЫЕ транзакции где хотя бы один кошелек в top_wallets
-        # Это предотвратит потерю информации о связях
-        filtered_transactions = [
-            tx for tx in transactions
-            if tx.get("from") in top_wallets or tx.get("to") in top_wallets
-        ]
-        logger.info(f"After filtering (ANY wallet in top_wallets): {len(filtered_transactions)} transactions")
-        
-        # Также собираем ВСЕ кошельки из финальных транзакций для графа
-        all_wallet_ids_in_final = set()
-        for tx in filtered_transactions:
-            if tx.get("from"):
-                all_wallet_ids_in_final.add(tx.get("from"))
-            if tx.get("to"):
-                all_wallet_ids_in_final.add(tx.get("to"))
-        logger.info(f"Total unique wallets in filtered transactions: {len(all_wallet_ids_in_final)}")
-        
-        # Apply additional filters if specified
-        if asset_filter and "All" not in asset_filter:
-            before_count = len(filtered_transactions)
-            filtered_transactions = [
-                tx for tx in filtered_transactions
-                if tx.get("asset_code", "XLM") in asset_filter
-            ]
-            logger.info(f"After asset filter ({asset_filter}): {len(filtered_transactions)} (removed {before_count - len(filtered_transactions)})")
-        
-        if tx_type_filter and "All" not in tx_type_filter:
-            before_count = len(filtered_transactions)
-            filtered_transactions = [
-                tx for tx in filtered_transactions
-                if tx.get("type") in tx_type_filter
-            ]
-            logger.info(f"After tx_type filter ({tx_type_filter}): {len(filtered_transactions)} (removed {before_count - len(filtered_transactions)})")
-        
-        if date_from or date_to:
-            from datetime import datetime
-            before_count = len(filtered_transactions)
-            filtered_by_date = []
-            for tx in filtered_transactions:
-                tx_date_str = tx.get("created_at")
-                if tx_date_str:
-                    try:
-                        # Parse ISO format date
-                        tx_date = datetime.fromisoformat(tx_date_str.replace('Z', '+00:00'))
-                        
-                        # Check date range
-                        if date_from and tx_date.date() < date_from:
-                            continue
-                        if date_to and tx_date.date() > date_to:
-                            continue
-                        
-                        filtered_by_date.append(tx)
-                    except:
-                        # If date parsing fails, include the transaction
-                        filtered_by_date.append(tx)
-            filtered_transactions = filtered_by_date
-            logger.info(f"After date filter ({date_from} to {date_to}): {len(filtered_transactions)} (removed {before_count - len(filtered_transactions)})")
-        
-        # Filter by direction (Sent/Received) relative to start_wallet
-        if direction_filter and "All" not in direction_filter:
-            before_count = len(filtered_transactions)
-            filtered_by_direction = []
-            for tx in filtered_transactions:
-                tx_from = tx.get("from")
-                tx_to = tx.get("to")
-                
-                # Check if transaction matches direction filter
-                is_sent = (tx_from == start_wallet)
-                is_received = (tx_to == start_wallet)
-                
-                include_tx = False
-                if "Sent" in direction_filter and is_sent:
-                    include_tx = True
-                if "Received" in direction_filter and is_received:
-                    include_tx = True
-                
-                if include_tx:
-                    filtered_by_direction.append(tx)
-            
-            filtered_transactions = filtered_by_direction
-            logger.info(f"After direction filter ({direction_filter}): {len(filtered_transactions)} (removed {before_count - len(filtered_transactions)})")
-        
-        # Filter by amount (-1.0 означает "не задано")
-        if (min_amount is not None and min_amount >= 0) or (max_amount is not None and max_amount >= 0):
-            before_count = len(filtered_transactions)
-            filtered_by_amount = []
-            for tx in filtered_transactions:
-                try:
-                    amount = float(tx.get("amount", 0))
-                    
-                    # Check amount range (игнорируем -1.0)
-                    if min_amount is not None and min_amount >= 0 and amount < min_amount:
+        # Фильтруем транзакции
+        filtered_transactions = []
+        for tx in transactions:
+            # КРИТИЧНО: Оставляем ТОЛЬКО транзакции стартового кошелька!
+            if tx["from"] == start_wallet or tx["to"] == start_wallet:
+                # Apply additional filters
+                if direction_filter:
+                    if direction_filter == "Sent" and tx["from"] != start_wallet:
                         continue
-                    if max_amount is not None and max_amount >= 0 and amount > max_amount:
+                    if direction_filter == "Received" and tx["to"] != start_wallet:
                         continue
-                    
-                    filtered_by_amount.append(tx)
-                except (ValueError, TypeError):
-                    # If amount parsing fails, exclude the transaction
-                    pass
-            
-            filtered_transactions = filtered_by_amount
-            logger.info(f"After amount filter (min: {min_amount}, max: {max_amount}): {len(filtered_transactions)} (removed {before_count - len(filtered_transactions)})")
+                
+                if min_amount and tx["amount"] < min_amount:
+                    continue
+                if max_amount and tx["amount"] > max_amount:
+                    continue
+                
+                filtered_transactions.append(tx)
         
-        logger.info(f"========== FINAL RESULT: {len(filtered_transactions)} transactions ==========")
+        logger.info(f"Filtered transactions: {len(transactions)} -> {len(filtered_transactions)}")
         
-        # Собираем статистику по фильтрации для диагностики
-        filtering_stats = {
-            "initial_transactions": len(transactions),
-            "after_top_wallets_filter": len([
-                tx for tx in transactions
-                if tx.get("from") in top_wallets or tx.get("to") in top_wallets
-            ]),
-            "final_transactions": len(filtered_transactions),
-            "transactions_lost": len(transactions) - len(filtered_transactions),
-        }
-        
-        logger.info(f"📊 FILTERING STATISTICS:")
-        logger.info(f"  Initial collected: {filtering_stats['initial_transactions']}")
-        logger.info(f"  After top_wallets: {filtering_stats['after_top_wallets_filter']}")
-        logger.info(f"  Final (after all filters): {filtering_stats['final_transactions']}")
-        logger.info(f"  Total lost: {filtering_stats['transactions_lost']} ({filtering_stats['transactions_lost']/filtering_stats['initial_transactions']*100:.1f}%)")
-        
-        # Собираем все уникальные кошельки из финальных транзакций
-        all_wallet_ids = set(top_wallets)
-        for tx in filtered_transactions:
-            if tx.get("from"):
-                all_wallet_ids.add(tx.get("from"))
-            if tx.get("to"):
-                all_wallet_ids.add(tx.get("to"))
-        
-        logger.info(f"Total unique wallets in final data: {len(all_wallet_ids)} (top_wallets: {len(top_wallets)})")
-        
-        # Fetch detailed account data for all wallets
+        # Get details for top wallets
         wallet_details = {}
-        wallets_not_found = []
+        for wallet_id in top_wallets:
+            details = wallet_activity.get(wallet_id, {
+                "transaction_count": 0,
+                "total_volume": 0,
+                "counterparties": set()
+            })
+            
+            # Mark if it's a direct partner
+            is_direct = wallet_id in direct_partners
+            
+            wallet_details[wallet_id] = {
+                "id": wallet_id,
+                "transaction_count": details["transaction_count"],
+                "total_volume": details["total_volume"],
+                "unique_counterparties": len(details["counterparties"]),
+                "is_direct_partner": is_direct,
+                "has_direct_tx_with_start": details.get('has_direct_tx_with_start', False)
+            }
         
-        for wallet_id in all_wallet_ids:
-            details = await self.client.get_account(wallet_id)
-            if details:
-                # Add activity metrics if available
-                if wallet_id in wallet_activity:
-                    details["transaction_count"] = wallet_activity[wallet_id]["transaction_count"]
-                    details["total_volume"] = wallet_activity[wallet_id]["total_volume"]
-                    details["counterparties"] = len(wallet_activity[wallet_id]["counterparties"])
-                else:
-                    # Default values for wallets not in original top list
-                    details["transaction_count"] = 0
-                    details["total_volume"] = 0
-                    details["counterparties"] = 0
-                wallet_details[wallet_id] = details
-            else:
-                # Wallet not found - but it appears in transactions!
-                # Create placeholder data so it still appears on graph
-                wallets_not_found.append(wallet_id)
-                wallet_details[wallet_id] = {
-                    "id": wallet_id,
-                    "balance_xlm": 0.0,
-                    "transaction_count": 0,
-                    "total_volume": 0.0,
-                    "counterparties": 0,
-                    "account_not_found": True  # Flag for UI
-                }
-                logger.debug(f"Wallet {wallet_id[:12]}... not found but appears in transactions - added as placeholder")
+        # Calculate unique wallets
+        unique_wallets = set()
+        for tx in filtered_transactions:
+            unique_wallets.add(tx["from"])
+            unique_wallets.add(tx["to"])
         
-        if wallets_not_found:
-            logger.info(f"📊 {len(wallets_not_found)} wallets not found via get_account but appear in transactions (added as placeholders)")
+        logger.info(f"Total unique wallets in filtered transactions: {len(unique_wallets)}")
         
-        logger.info(f"✅ Final wallet_details: {len(wallet_details)} wallets (including {len(wallets_not_found)} placeholders)")
-        
-        # Проверяем полноту данных
-        data_completeness = {
-            "has_more_data": False,
-            "total_pages_loaded": 0,
-            "truncated_wallets": [],
-            "is_complete": True,
-            "wallets_check": {}
+        # Add filtering stats
+        filtering_stats = {
+            "total_discovered_wallets": len(wallet_activity),
+            "total_discovered_transactions": len(transactions),
+            "direct_partners_count": len(direct_partners),
+            "top_wallets_selected": len(top_wallets),
+            "filtered_transactions": len(filtered_transactions),
+            "unique_wallets_in_result": len(unique_wallets)
         }
         
-        # Собираем информацию о полноте по всем кошелькам
-        if hasattr(self, 'data_completeness_info'):
-            for wallet_id, info_list in self.data_completeness_info.items():
-                wallet_complete = True
-                total_pages = 0
-                for info in info_list:
-                    if info.get("has_more", False):
-                        wallet_complete = False
-                        data_completeness["has_more_data"] = True
-                        data_completeness["truncated_wallets"].append(wallet_id[:8] + "...")
-                    total_pages += info.get("pages_loaded", 0)
-                
-                data_completeness["wallets_check"][wallet_id[:8] + "..."] = {
-                    "complete": wallet_complete,
-                    "pages": total_pages
-                }
-                data_completeness["total_pages_loaded"] += total_pages
-        
-        data_completeness["is_complete"] = not data_completeness["has_more_data"]
-        
-        # Очищаем информацию для следующего запроса
+        # Add data completeness info
+        data_completeness = self.data_completeness_info.copy() if hasattr(self, 'data_completeness_info') else {}
         self.data_completeness_info = {}
         
         return {
@@ -789,8 +533,8 @@ class StellarDataFetcher:
                 "depth_explored": depth,
                 "wallets_discovered": len(wallet_activity),
                 "strategy": strategy,
-                "filtering_stats": filtering_stats,  # ← NEW: Добавили статистику фильтрации
-                "data_completeness": data_completeness  # ← NEW: Информация о полноте данных
+                "filtering_stats": filtering_stats,
+                "data_completeness": data_completeness
             }
         }
     
@@ -806,14 +550,16 @@ class StellarDataFetcher:
         asset_filter: Optional[List[str]] = None,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
-        max_pages: int = 50  # Увеличено с 25!
+        max_pages: int = 50
     ):
         """
         Collect wallet activity data recursively WITH FILTERS and PAGINATION.
         
         Gets ALL transactions for the specified period and asset!
         """
-        if current_depth >= max_depth or len(wallet_activity) >= max_collect:
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: изменено >= на >
+        # EGO-GRAPH MODE: depth=0 загружает ТОЛЬКО стартовый кошелёк
+        if current_depth > max_depth or len(wallet_activity) >= max_collect:
             return
         
         if wallet_id in visited:
@@ -845,51 +591,47 @@ class StellarDataFetcher:
             for asset_code in assets_to_fetch:
                 logger.info(f"Fetching {asset_code or 'ALL'} payments for {wallet_id[:8]}...")
                 
-                payments = await self.client.get_all_payments_filtered(
+                payments = await self.get_all_payments_filtered(
                     account_id=wallet_id,
                     asset_code=asset_code,
                     date_from=date_from,
                     date_to=date_to,
-                    max_pages=max_pages  # Используем переданный параметр
+                    max_pages=max_pages
                 )
                 
                 logger.info(f"Got {len(payments)} payments for asset {asset_code or 'ALL'}")
                 all_payments.extend(payments)
                 
                 # Сохраняем информацию о полноте для этого кошелька
-                if hasattr(self.client, 'last_fetch_info') and self.client.last_fetch_info:
-                    if wallet_id not in self.client.data_completeness_info:
-                        self.client.data_completeness_info[wallet_id] = []
-                    self.client.data_completeness_info[wallet_id].append({
-                        "asset": asset_code or "ALL",
-                        "has_more": self.client.last_fetch_info.get("has_more", False),
-                        "pages_loaded": self.client.last_fetch_info.get("pages_loaded", 0),
-                        "is_complete": self.client.last_fetch_info.get("is_complete", True)
+                if hasattr(self, 'last_fetch_info') and self.last_fetch_info:
+                    if wallet_id not in self.data_completeness_info:
+                        self.data_completeness_info[wallet_id] = []
+                    self.data_completeness_info[wallet_id].append({
+                        'asset': asset_code or 'ALL',
+                        **self.last_fetch_info
                     })
+                    self.last_fetch_info = None
             
-            logger.info(f"Total collected {len(all_payments)} payments for {wallet_id[:8]}")
+            logger.info(f"Got {len(all_payments)} payments total for {wallet_id[:8]}")
             
-            # ДЕТАЛЬНОЕ логирование первых 3 транзакций
-            if all_payments:
-                logger.info(f"📋 SAMPLE TRANSACTIONS (first 3):")
-                for i, p in enumerate(all_payments[:3]):
-                    logger.info(f"  TX {i+1}: from={p.get('from', 'N/A')[:8]} to={p.get('to', 'N/A')[:8]} "
-                              f"asset={p.get('asset_code', 'XLM')} amount={p.get('amount')} date={p.get('created_at')}")
-            
-            logger.info(f"==========================================")
-            
+            # Process payments
             tx_added = 0
             for payment in all_payments:
-                if "from" in payment and "to" in payment:
-                    from_wallet = payment["from"]
-                    to_wallet = payment["to"]
-                    amount = float(payment.get("amount", 0))
+                from_wallet = payment["from"]
+                to_wallet = payment["to"]
+                amount = payment["amount"]
+                
+                # Skip if neither wallet is in our target set
+                if from_wallet == wallet_id or to_wallet == wallet_id:
+                    # Add transaction to global list (avoid duplicates)
+                    tx_key = f"{payment['transaction_hash']}_{from_wallet}_{to_wallet}"
+                    if not any(tx.get('transaction_hash') == payment['transaction_hash'] and 
+                              tx.get('from') == from_wallet and tx.get('to') == to_wallet 
+                              for tx in transactions):
+                        transactions.append(payment)
+                        tx_added += 1
                     
-                    # Track transaction
-                    transactions.append(payment)
-                    tx_added += 1
-                    
-                    # Update activity metrics for both wallets
+                    # Update wallet activity
                     for w in [from_wallet, to_wallet]:
                         if w not in wallet_activity:
                             wallet_activity[w] = {
@@ -906,7 +648,7 @@ class StellarDataFetcher:
                     wallet_activity[to_wallet]["counterparties"].add(from_wallet)
                     
                     # Explore connected wallets (only if depth allows)
-                    if current_depth + 1 < max_depth:
+                    if current_depth < max_depth:
                         for next_wallet in [from_wallet, to_wallet]:
                             if next_wallet != wallet_id and next_wallet not in visited and len(wallet_activity) < max_collect:
                                 await self._collect_wallet_activity(
@@ -920,7 +662,7 @@ class StellarDataFetcher:
                                     asset_filter=asset_filter,
                                     date_from=date_from,
                                     date_to=date_to,
-                                    max_pages=max_pages  # ПЕРЕДАЕМ max_pages
+                                    max_pages=max_pages
                                 )
             
             logger.info(f"✅ Added {tx_added} transactions from {wallet_id[:8]} to global list")
@@ -943,16 +685,10 @@ class StellarDataFetcher:
         Returns:
             Network data with top active wallets
         """
-        # This would ideally query an indexed database or use Stellar's 
-        # trade aggregation endpoints for efficiency
-        # For now, we'll use a sampling approach
-        
         logger.info(f"Fetching top {limit} active wallets...")
         
-        # Start with known active addresses (exchanges, anchors)
         seed_wallets = [
-            # These would be real known active addresses
-            "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",  # Example
+            "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
         ]
         
         wallet_activity = {}
@@ -966,14 +702,12 @@ class StellarDataFetcher:
                 strategy="most_active"
             )
             
-            # Merge results
             for wallet_id, details in data["wallets"].items():
                 if wallet_id not in wallet_activity:
                     wallet_activity[wallet_id] = details
             
             all_transactions.extend(data["transactions"])
         
-        # Sort by activity and return top
         sorted_wallets = sorted(
             wallet_activity.items(),
             key=lambda x: x[1].get("transaction_count", 0),
@@ -989,5 +723,6 @@ class StellarDataFetcher:
                 "total_wallets": len(top_wallets),
                 "total_transactions": len(all_transactions),
                 "sampling_seeds": len(seed_wallets),
+                "start_wallet": start_wallet,  # КРИТИЧНО: стартовый кошелёк
             }
         }

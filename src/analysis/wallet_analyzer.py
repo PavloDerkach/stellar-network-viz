@@ -302,7 +302,21 @@ class WalletAnalyzer:
         total_volume = sent_volume + received_volume
         
         # Calculate dates
-        dates = [tx.get("created_at") for tx in all_txs if tx.get("created_at")]
+        from datetime import datetime
+        dates = []
+        for tx in all_txs:
+            if tx.get("created_at"):
+                date_str = tx["created_at"]
+                # Convert string to datetime if needed
+                if isinstance(date_str, str):
+                    try:
+                        date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                        dates.append(date_obj)
+                    except:
+                        pass
+                else:
+                    dates.append(date_str)
+        
         first_tx = min(dates) if dates else None
         last_tx = max(dates) if dates else None
         
